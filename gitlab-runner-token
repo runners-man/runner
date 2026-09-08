@@ -39,6 +39,10 @@ usage: $PROG --name <runner> [options] -- <command...>
   --min-remaining-days N Auto-rotate when the current token expires within N days.
                          Default 14. Ignored when the token has no expiry.
   --keep-old-runner      With --rotate, do not delete the superseded runner in GitLab.
+  --no-mint              Never create a runner. If no token can be read back, export a
+                         placeholder that satisfies the variable's validation. For
+                         \`terraform destroy\` and read-only plans, where Terraform still
+                         demands a value for a required variable but will never write it.
 
   The GitLab PAT is read from \$GITLAB_API_TOKEN, or from the \`credentials\` block for the
   GitLab host in ~/.terraformrc (or \$TF_CLI_CONFIG_FILE).
@@ -48,7 +52,7 @@ EOF
 
 NAME="" SCOPE="" SCOPE_ID="" TAG_LIST=""
 GITLAB="${GITLAB_URL:-}" REGION="${AWS_REGION:-eu-west-2}"
-ROTATE=false MIN_DAYS=14 DELETE_OLD=true
+ROTATE=false MIN_DAYS=14 DELETE_OLD=true NO_MINT=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -61,6 +65,7 @@ while [ $# -gt 0 ]; do
     --rotate)             ROTATE=true; shift ;;
     --min-remaining-days) MIN_DAYS="$2"; shift 2 ;;
     --keep-old-runner)    DELETE_OLD=false; shift ;;
+    --no-mint)            NO_MINT=true; shift ;;
     --)                   shift; break ;;
     *)                    usage ;;
   esac
@@ -134,7 +139,7 @@ if [ "$ROTATE" != "true" ]; then
     HAVE_TOKEN=true
     log "reusing the token already in $TOKEN_PARAM (runner id ${RUNNER_ID:-unknown}, expires $EXPIRES_AT)"
   else
-    log "no usable token in $TOKEN_PARAM; a new runner will be created"
+    log "no usable token in $TOKEN_PARAM"
   fi
 fi
 
@@ -168,9 +173,22 @@ fi
 # ---------------------------------------------------------------------------
 # Step 3 — mint
 # ---------------------------------------------------------------------------
+if [ "$HAVE_TOKEN" != "true" ] && [ "$NO_MINT" = "true" ]; then
+  # `terraform destroy` still insists on a value for a required variable, even for a resource
+  # it is about to delete. Rather than mint a live GitLab runner purely to tear one down, hand
+  # Terraform something that satisfies the `startswith("glrt-")` validation and nothing else.
+  log "WARN: --no-mint and no token in SSM — exporting a placeholder."
+  log "WARN: this is safe for destroy and for plans. If you APPLY with it, the placeholder is"
+  log "WARN: written to SSM and the Runner will fail to register. Re-run without --no-mint."
+  printf 'glrt-PLACEHOLDER-DO-NOT-APPLY' > "$WORKDIR/token"
+  RUNNER_ID="${RUNNER_ID:-1}"
+  HAVE_TOKEN=true
+fi
+
 if [ "$HAVE_TOKEN" != "true" ]; then
   [ -n "$SCOPE" ] && [ -n "$SCOPE_ID" ] || {
-    echo "$PROG: --scope and --id are required to create a runner" >&2; exit 2; }
+    echo "$PROG: --scope and --id are required to create a runner" >&2
+    echo "$PROG: (for a destroy or a read-only plan, use --no-mint instead)" >&2; exit 2; }
 
   case "$SCOPE" in
     group)   RUNNER_TYPE=group_type;   ID_FIELD=group_id   ;;

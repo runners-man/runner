@@ -1,0 +1,89 @@
+# Sketch of the pipeline that stitches the three phases together.
+#
+# The ordering is enforced here, not by Terraform, because the middle phase is not Terraform.
+# That is the structural cost of this design and it should be written down where people can
+# see it, not discovered when someone runs the stages out of order.
+
+stages: [bootstrap, provision, runner, teardown]
+
+variables:
+  AWS_REGION: eu-west-2
+  GITLAB_URL: https://gitlab.internal.example.com
+  RUNNER_NAME: payments-ci
+  TF_IN_AUTOMATION: "true"
+  # Never set CI_DEBUG_TRACE on this pipeline. The provisioning script defends against it with
+  # `set +x`, but a debug trace would also print the OIDC assertions.
+
+default:
+  image: registry.internal.example.com/ci/terraform:1.11
+
+# ---------------------------------------------------------------------------
+# Secret zero.
+#
+# GITLAB_API_TOKEN is the credential that can mint runner tokens. It is the one thing this
+# whole design cannot bootstrap away — something has to hold it.
+#
+# Use a *group access token* with only the `create_runner` scope, stored as a masked, protected
+# CI/CD variable on the platform group, with an expiry and a calendar reminder. Not a personal
+# access token: PATs inherit the human's full permissions and die when they leave.
+#
+# Note the asymmetry: `create_runner` cannot delete runners. Teardown needs a second, broader
+# credential — see scripts/deprovision-runner-token.sh.
+# ---------------------------------------------------------------------------
+
+.aws_oidc: &aws_oidc
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: gitlab.internal.example.com
+  before_script:
+    - |
+      creds=$(aws sts assume-role-with-web-identity \
+        --role-arn "$PROVISIONER_ROLE_ARN" \
+        --role-session-name "provision-${CI_JOB_ID}" \
+        --web-identity-token "$AWS_ID_TOKEN" \
+        --query Credentials --output json)
+      export AWS_ACCESS_KEY_ID=$(echo "$creds" | jq -r .AccessKeyId)
+      export AWS_SECRET_ACCESS_KEY=$(echo "$creds" | jq -r .SecretAccessKey)
+      export AWS_SESSION_TOKEN=$(echo "$creds" | jq -r .SessionToken)
+
+bootstrap:
+  stage: bootstrap
+  script:
+    - terraform -chdir=bootstrap init
+    - terraform -chdir=bootstrap apply -auto-approve
+  # Idempotent and cheap. Safe to run every pipeline.
+
+provision-token:
+  stage: provision
+  <<: *aws_oidc
+  script:
+    - export PARAM=$(terraform -chdir=bootstrap output -raw auth_token_parameter_name)
+    - export KMS=$(terraform -chdir=bootstrap output -raw auth_token_kms_key_arn)
+    - |
+      ./scripts/provision-runner-token.sh \
+        --scope group --id "$RUNNER_GROUP_ID" \
+        --name "$RUNNER_NAME" \
+        --parameter "$PARAM" \
+        --kms-key-arn "$KMS" \
+        --tags "docker,linux,$RUNNER_NAME"
+  # The script is a no-op when the parameter and the GitLab runner both already exist, so this
+  # job is also safe to run every pipeline. That property is load-bearing: without it, every
+  # pipeline run mints a runner nobody deletes.
+
+runner:
+  stage: runner
+  script:
+    - terraform -chdir=runner init
+    - terraform -chdir=runner apply -auto-approve
+  needs: [provision-token]
+
+teardown:
+  stage: teardown
+  when: manual
+  variables:
+    # Deliberately a different, broader credential. See the script's header.
+    GITLAB_API_TOKEN: $GITLAB_ADMIN_API_TOKEN
+  script:
+    - terraform -chdir=runner destroy -auto-approve
+    - ./scripts/deprovision-runner-token.sh --parameter "$(terraform -chdir=bootstrap output -raw auth_token_parameter_name)"
+    - terraform -chdir=bootstrap destroy -auto-approve

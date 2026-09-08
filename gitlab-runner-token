@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+#
+# Resolve a GitLab Runner authentication token and hand it to a command as TF_VAR_*.
+#
+#   gitlab-runner-token --name payments-ci --scope group --id 1234 -- terragrunt apply
+#
+# The token is exported into the child process only. It is never printed, never written to
+# disk, never placed in argv, and never returned to your shell — there is deliberately no
+# `--print-env` mode, because `eval $(...)` would leave it in your shell environment and in
+# your history for the rest of the day.
+#
+# Resolution order:
+#   1. TF_VAR_runner_auth_token already set   -> use it, do nothing
+#   2. the SSM parameter exists               -> read it back (no new runner is created)
+#   3. otherwise, or with --rotate            -> POST /api/v4/user/runners, mint a new one
+#
+# Step 2 is what makes a plain `terragrunt apply` on day 2 work without minting a runner
+# every time. Because value_wo_version is unchanged in that case, Terraform sends nothing to
+# AWS — the read is purely to satisfy the variable.
+#
+set -euo pipefail
+set +x
+
+PROG="$(basename "$0")"
+
+usage() {
+  cat >&2 <<EOF
+usage: $PROG --name <runner> [options] -- <command...>
+
+  --name <runner>        Runner deployment name; must match the module's \`name\`.
+  --scope group|project  Only needed when minting. Group scope requires you to be a
+                         Maintainer or Owner of the group; project scope requires
+                         Maintainer on the project.
+  --id <numeric id>      Group id or project id to attach the runner to.
+  --gitlab-url <url>     Defaults to \$GITLAB_URL.
+  --region <region>      Defaults to \$AWS_REGION, then eu-west-2.
+  --tags <a,b,c>         Runner tag list. Default: docker,linux,<name>
+  --rotate               Mint a fresh runner even if a token already exists.
+  --min-remaining-days N Auto-rotate when the current token expires within N days.
+                         Default 14. Ignored when the token has no expiry.
+  --keep-old-runner      With --rotate, do not delete the superseded runner in GitLab.
+
+  The GitLab PAT is read from \$GITLAB_API_TOKEN, or from the \`credentials\` block for the
+  GitLab host in ~/.terraformrc (or \$TF_CLI_CONFIG_FILE).
+EOF
+  exit 2
+}
+
+NAME="" SCOPE="" SCOPE_ID="" TAG_LIST=""
+GITLAB="${GITLAB_URL:-}" REGION="${AWS_REGION:-eu-west-2}"
+ROTATE=false MIN_DAYS=14 DELETE_OLD=true
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name)               NAME="$2"; shift 2 ;;
+    --scope)              SCOPE="$2"; shift 2 ;;
+    --id)                 SCOPE_ID="$2"; shift 2 ;;
+    --gitlab-url)         GITLAB="$2"; shift 2 ;;
+    --region)             REGION="$2"; shift 2 ;;
+    --tags)               TAG_LIST="$2"; shift 2 ;;
+    --rotate)             ROTATE=true; shift ;;
+    --min-remaining-days) MIN_DAYS="$2"; shift 2 ;;
+    --keep-old-runner)    DELETE_OLD=false; shift ;;
+    --)                   shift; break ;;
+    *)                    usage ;;
+  esac
+done
+
+[ -n "$NAME" ] || usage
+[ $# -gt 0 ] || { echo "$PROG: no command given after --" >&2; usage; }
+[ -n "$GITLAB" ] || { echo "$PROG: --gitlab-url or GITLAB_URL is required" >&2; exit 2; }
+
+TOKEN_PARAM="/platform/gitlab-runner/$NAME/auth-token"
+META_PARAM="/platform/gitlab-runner/$NAME/token-meta"
+TAG_LIST="${TAG_LIST:-docker,linux,$NAME}"
+
+WORKDIR="$(mktemp -d)"; chmod 700 "$WORKDIR"
+trap 'rm -rf "$WORKDIR"' EXIT INT TERM
+umask 077
+
+log() { printf '%s [%s] %s\n' "$(date -u +%H:%M:%SZ)" "$PROG" "$*" >&2; }
+
+# ---------------------------------------------------------------------------
+# GitLab credential
+# ---------------------------------------------------------------------------
+# ~/.terraformrc holds it as:
+#
+#   credentials "gitlab.internal.example.com" {
+#     token = "glpat-..."
+#   }
+#
+# which is already how you authenticate to the GitLab Terraform module registry, so for most
+# people there is nothing new to set up.
+read_terraformrc_token() {
+  local host="$1" rc="${TF_CLI_CONFIG_FILE:-$HOME/.terraformrc}"
+  [ -f "$rc" ] || return 1
+  awk -v host="$host" '
+    $1 == "credentials" {
+      gsub(/"/, "", $2)
+      inblock = ($2 == host)
+    }
+    inblock && $1 == "token" {
+      gsub(/^[^"]*"|"[^"]*$/, "")
+      print
+      exit
+    }
+  ' "$rc"
+}
+
+gitlab_host() { printf '%s' "$GITLAB" | sed -e 's#^https\?://##' -e 's#/.*##'; }
+
+# ---------------------------------------------------------------------------
+# Step 1 — already supplied
+# ---------------------------------------------------------------------------
+if [ -n "${TF_VAR_runner_auth_token:-}" ] && [ "$ROTATE" != "true" ]; then
+  log "TF_VAR_runner_auth_token already set; passing it through unchanged"
+  exec "$@"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 2 — read back what Terraform already provisioned
+# ---------------------------------------------------------------------------
+RUNNER_ID="" EXPIRES_AT="never" HAVE_TOKEN=false
+
+if [ "$ROTATE" != "true" ]; then
+  if aws ssm get-parameter --region "$REGION" --name "$TOKEN_PARAM" --with-decryption \
+       --query 'Parameter.Value' --output text > "$WORKDIR/token" 2>/dev/null \
+     && [ -s "$WORKDIR/token" ] && grep -q '^glrt-' "$WORKDIR/token"; then
+
+    META="$(aws ssm get-parameter --region "$REGION" --name "$META_PARAM" \
+              --query 'Parameter.Value' --output text 2>/dev/null || echo '{}')"
+    RUNNER_ID="$(printf '%s' "$META" | jq -r '.runner_id // empty')"
+    EXPIRES_AT="$(printf '%s' "$META" | jq -r '.expires_at // "never"')"
+    HAVE_TOKEN=true
+    log "reusing the token already in $TOKEN_PARAM (runner id ${RUNNER_ID:-unknown}, expires $EXPIRES_AT)"
+  else
+    log "no usable token in $TOKEN_PARAM; a new runner will be created"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Expiry
+# ---------------------------------------------------------------------------
+# GitLab only auto-rotates a runner's token when the group or project sets an expiry, and it
+# writes the rotated value into config.toml on the running host — never back to SSM. On this
+# architecture the host is replaced every morning, so a rotated token is lost and the next
+# instance boots with a stale one from SSM. That is cattle-ops issue #1196, still open.
+#
+# The clean answer is to leave "Runners expiration" empty for platform-provisioned runners and
+# rotate deliberately, with --rotate, on your own cadence. If your policy forbids that, this
+# block rotates ahead of expiry so SSM is never the stale copy.
+if [ "$HAVE_TOKEN" = "true" ] && [ "$EXPIRES_AT" != "never" ] && [ "$EXPIRES_AT" != "null" ]; then
+  EXPIRY_EPOCH="$(date -u -d "$EXPIRES_AT" +%s 2>/dev/null || echo 0)"
+  NOW_EPOCH="$(date -u +%s)"
+  REMAINING_DAYS=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
+
+  if [ "$EXPIRY_EPOCH" -eq 0 ]; then
+    log "WARN: could not parse token expiry '$EXPIRES_AT'; not rotating"
+  elif [ "$REMAINING_DAYS" -lt "$MIN_DAYS" ]; then
+    log "token expires in ${REMAINING_DAYS}d (threshold ${MIN_DAYS}d) — rotating"
+    ROTATE=true
+    HAVE_TOKEN=false
+  else
+    log "token valid for a further ${REMAINING_DAYS}d"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Step 3 — mint
+# ---------------------------------------------------------------------------
+if [ "$HAVE_TOKEN" != "true" ]; then
+  [ -n "$SCOPE" ] && [ -n "$SCOPE_ID" ] || {
+    echo "$PROG: --scope and --id are required to create a runner" >&2; exit 2; }
+
+  case "$SCOPE" in
+    group)   RUNNER_TYPE=group_type;   ID_FIELD=group_id   ;;
+    project) RUNNER_TYPE=project_type; ID_FIELD=project_id ;;
+    *)       echo "$PROG: --scope must be group or project" >&2; exit 2 ;;
+  esac
+
+  PAT="${GITLAB_API_TOKEN:-$(read_terraformrc_token "$(gitlab_host)" || true)}"
+  [ -n "$PAT" ] || {
+    echo "$PROG: no GitLab token. Set GITLAB_API_TOKEN, or add a credentials block for" >&2
+    echo "       $(gitlab_host) to ~/.terraformrc." >&2
+    exit 1; }
+
+  # The PAT goes in a config file, not on the command line, so it is not visible in `ps`.
+  printf 'header = "PRIVATE-TOKEN: %s"\n' "$PAT" > "$WORKDIR/curlrc"
+
+  PREVIOUS_ID="$RUNNER_ID"
+
+  log "creating $RUNNER_TYPE runner for $ID_FIELD=$SCOPE_ID"
+  STATUS="$(curl --silent --show-error --config "$WORKDIR/curlrc" \
+    --request POST --url "$GITLAB/api/v4/user/runners" \
+    --data-urlencode "runner_type=$RUNNER_TYPE" \
+    --data-urlencode "$ID_FIELD=$SCOPE_ID" \
+    --data-urlencode "description=$NAME (platform golden path)" \
+    --data-urlencode "tag_list=$TAG_LIST" \
+    --data-urlencode "run_untagged=false" \
+    --data-urlencode "locked=true" \
+    --output "$WORKDIR/response.json" --write-out '%{http_code}')"
+
+  if [ "$STATUS" != "201" ]; then
+    log "ERROR: GitLab returned HTTP $STATUS"
+    case "$STATUS" in
+      403) log "ERROR: 403 usually means you are not a Maintainer/Owner of $SCOPE $SCOPE_ID," ;;
+      401) log "ERROR: 401 means the token is invalid, expired, or lacks the create_runner scope." ;;
+    esac
+    sed -e 's/glrt-[A-Za-z0-9_-]*/glrt-REDACTED/g' "$WORKDIR/response.json" >&2 || true
+    exit 1
+  fi
+
+  jq -r '.token' "$WORKDIR/response.json" | tr -d '\n' > "$WORKDIR/token"
+  RUNNER_ID="$(jq -r '.id' "$WORKDIR/response.json")"
+  # Normalise to whole seconds so Terraform's timecmp() accepts it as RFC3339.
+  EXPIRES_AT="$(jq -r '.token_expires_at // "never"' "$WORKDIR/response.json" \
+                 | sed -E 's/\.[0-9]+Z$/Z/; s/\.[0-9]+([+-][0-9:]+)$/\1/')"
+
+  grep -q '^glrt-' "$WORKDIR/token" || {
+    log "ERROR: no usable token in the response; runner $RUNNER_ID is orphaned in GitLab"; exit 1; }
+
+  log "created runner id=$RUNNER_ID expires=$EXPIRES_AT"
+
+  if [ -n "$PREVIOUS_ID" ] && [ "$DELETE_OLD" = "true" ]; then
+    DS="$(curl --silent --show-error --config "$WORKDIR/curlrc" \
+      --request DELETE --url "$GITLAB/api/v4/runners/$PREVIOUS_ID" \
+      --output /dev/null --write-out '%{http_code}')"
+    case "$DS" in
+      204|404) log "removed superseded runner $PREVIOUS_ID" ;;
+      *)       log "WARN: could not delete superseded runner $PREVIOUS_ID (HTTP $DS)."
+               log "WARN: it will sit offline in the runner list until removed by hand." ;;
+    esac
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Hand off
+# ---------------------------------------------------------------------------
+# The runner id doubles as the rotation counter. It is a database primary key, so it only ever
+# increases, and it changes exactly when — and only when — a new token is minted. That is
+# precisely the semantics value_wo_version wants, with nothing for a human to remember to bump.
+TF_VAR_runner_auth_token="$(cat "$WORKDIR/token")"
+export TF_VAR_runner_auth_token
+export TF_VAR_runner_auth_token_version="$RUNNER_ID"
+export TF_VAR_runner_auth_token_expires_at="$EXPIRES_AT"
+
+log "running: $*"
+exec "$@"

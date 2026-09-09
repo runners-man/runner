@@ -72,7 +72,7 @@ module "gitlab_runner" {
   # -------------------------------------------------------------------------
   # Our own CMK rather than upstream's managed one, so the same key covers the token
   # parameter, the cache bucket and the log group, and so its policy is auditable here.
-  kms_key_id             = aws_kms_key.runner.arn
+  kms_key_id             = local.kms_key_arn
   enable_managed_kms_key = false
 
   iam_permissions_boundary = local.iam_permissions_boundary_name
@@ -258,7 +258,7 @@ module "gitlab_runner" {
   runner_terminate_ec2_timeout_duration           = 90
   runner_terminate_ec2_lambda_egress_rules        = local.terminate_lambda_egress_rules
 
-  # Managed mode only — in BYO mode the parameter is not a Terraform resource here, so the
-  # ordering guarantee comes from the stack that creates it (see docs/token-provisioning.md).
-  depends_on = [aws_ssm_parameter.runner_auth_token]
+  # Managed mode only — in external mode the parameter belongs to another state, so the
+  # ordering guarantee comes from the stack that creates it (see docs/layout.md).
+  depends_on = [module.secrets]
 }

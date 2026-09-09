@@ -72,11 +72,29 @@ locals {
   # SSM parameter for the Runner authentication token
   # -------------------------------------------------------------------------
 
-  # In managed mode the module owns this parameter; in BYO mode the name is supplied and the
-  # parameter is created elsewhere. Either way this local is the single source of truth for the
-  # name passed to upstream, so runner.tf does not need to know which mode is active.
+  # Two modes, one pair of locals. Everything downstream — runner.tf, guardrails.tf, the IAM
+  # policy, the outputs — reads these and never needs to know which mode is active.
+  #
+  #   managed   this module composes modules/runner-secrets; the name and the key come from it
+  #   external  modules/runner-secrets ran as its own Terragrunt unit; both are passed in
+  #
+  # The name is taken from the submodule's output rather than re-derived here, so there is
+  # exactly one place that decides the parameter path. That matters more than it looks:
+  # upstream builds the instance role's ssm:GetParameter grant from this literal string, so two
+  # derivations that drifted apart would be an AccessDenied at boot, not a plan error.
   manage_auth_token_parameter = var.auth_token_parameter_name == null
-  auth_token_parameter_name   = coalesce(var.auth_token_parameter_name, "/platform/gitlab-runner/${var.name}/auth-token")
+
+  auth_token_parameter_name = (
+    local.manage_auth_token_parameter
+    ? one(module.secrets[*].auth_token_parameter_name)
+    : var.auth_token_parameter_name
+  )
+
+  kms_key_arn = (
+    local.manage_auth_token_parameter
+    ? one(module.secrets[*].kms_key_arn)
+    : var.auth_token_kms_key_arn
+  )
 
   # -------------------------------------------------------------------------
   # Deterministic child-module resource names

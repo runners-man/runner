@@ -61,7 +61,7 @@ output "auth_token_mode" {
 
 output "kms_key_arn" {
   description = "ARN of the customer-managed key encrypting the token, the cache and the logs for this deployment."
-  value       = aws_kms_key.runner.arn
+  value       = local.kms_key_arn
 }
 
 output "vpc_id" {
